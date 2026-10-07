@@ -13,3 +13,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Vendor manuals (copyrighted; keep locally for reference, don't publish)
+Documentation/*.pdf

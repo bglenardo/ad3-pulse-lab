@@ -11,6 +11,9 @@ import numpy as np
 from . import dwfapi as D
 from .dwfapi import DwfError, dwf
 
+# AD3 AWG sample rate (125 MS/s -> 8 ns steps).
+AWG_MAX_RATE = 125e6
+
 
 @dataclass
 class PulseSpec:
@@ -55,6 +58,20 @@ class PulseSpec:
     @property
     def timing_resolution(self) -> float:
         return self.period / self.samples
+
+    def fit_to_awg(self, max_rate: float = AWG_MAX_RATE, max_samples: int | None = None) -> float:
+        """Limit `samples` so the AWG plays them at <= max_rate; return the realised width.
+
+        The AWG plays the custom buffer at samples / period, so short pulses
+        with the default 4096 points would ask for far more than the device rate.
+        """
+        limit = max(2, int(self.period * max_rate + 1e-6))
+        if max_samples:
+            limit = min(limit, max_samples)
+        self.samples = min(self.samples, limit)
+        t = (np.arange(self.samples) + 0.5) / self.samples * self.period
+        high = (t >= self.pre_delay) & (t < self.pre_delay + self.width)
+        return np.count_nonzero(high) * self.timing_resolution
 
 
 @dataclass
@@ -198,8 +215,7 @@ class AnalogDiscovery:
 
         # The custom buffer depth is only reported once the function is selected.
         max_samples = self.max_awg_samples(pulse.channel)
-        if max_samples > 0:
-            pulse.samples = min(pulse.samples, max_samples)
+        pulse.fit_to_awg(AWG_MAX_RATE, max_samples if max_samples > 0 else None)
 
         data, span = pulse.render()
         buf = (c_double * len(data))(*data.tolist())
@@ -216,6 +232,21 @@ class AnalogDiscovery:
 
     def stop_output(self, channel: int = -1) -> None:
         dwf.FDwfAnalogOutConfigure(self._hdwf, c_int(channel), c_int(0))
+
+    def fire(self, pulse: PulseSpec, timeout: float = 5.0) -> None:
+        """Play a configured pulse once and wait for the AWG to finish (no AD3 capture)."""
+        self._wait_awg_idle(pulse.channel, timeout)
+        dwf.FDwfAnalogOutConfigure(self._hdwf, c_int(pulse.channel), c_int(1))
+        sts = c_byte()
+        deadline = time.monotonic() + timeout + pulse.total_time
+        while True:
+            dwf.FDwfAnalogOutStatus(self._hdwf, c_int(pulse.channel), byref(sts))
+            if sts.value == D.STATE_DONE:
+                return
+            if time.monotonic() > deadline:
+                self.stop_output(pulse.channel)
+                raise TimeoutError("AWG did not finish playing the pulse.")
+            time.sleep(0.001)
 
     # -- scope -------------------------------------------------------------
     def configure_scope(self, pulse: PulseSpec, scope: ScopeSpec) -> tuple[float, int]:
